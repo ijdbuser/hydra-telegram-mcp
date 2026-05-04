@@ -203,7 +203,14 @@ async def get_media_info(chat_id: Union[int, str], message_id: int, account: str
         if not msg or not msg.media:
             return "No media found in the specified message."
 
-        return str(msg.media)
+        payload = {
+            "message_id": msg.id,
+            "media": str(msg.media),
+        }
+        post_author = get_post_author(msg)
+        if post_author:
+            payload["post_author"] = post_author
+        return format_tool_result([payload])
     except Exception as e:
         return log_and_format_error("get_media_info", e, chat_id=chat_id, message_id=message_id)
 

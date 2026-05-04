@@ -479,6 +479,7 @@ def test_message_formatting_sender_and_engagement_helpers():
         from_id=PeerUser(user_id=99),
         media=SimpleNamespace(),
         sender=SimpleNamespace(first_name="Jane", last_name="Doe"),
+        post_author="Admin\nOne",
         views=10,
         forwards=2,
         reactions=SimpleNamespace(results=[SimpleNamespace(count=3), SimpleNamespace(count=None)]),
@@ -487,8 +488,11 @@ def test_message_formatting_sender_and_engagement_helpers():
     formatted = runtime.format_message(message)
     assert formatted["from_id"] == 99
     assert formatted["has_media"] is True
+    assert formatted["post_author"] == "Admin One"
     assert formatted["text"] == "helloworld"
     assert runtime.get_sender_name(message) == "Jane Doe"
+    assert runtime.get_post_author(message) == "Admin One"
+    assert runtime.get_post_author(SimpleNamespace()) is None
     assert runtime.get_sender_name(SimpleNamespace(sender=None)) == "Unknown"
     assert (
         runtime.get_sender_name(SimpleNamespace(sender=SimpleNamespace(title="A\nGroup")))

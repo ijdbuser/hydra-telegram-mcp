@@ -740,11 +740,23 @@ def format_message(message) -> Dict[str, Any]:
     if message.from_id:
         result["from_id"] = utils.get_peer_id(message.from_id)
 
+    post_author = get_post_author(message)
+    if post_author:
+        result["post_author"] = post_author
+
     if message.media:
         result["has_media"] = True
         result["media_type"] = type(message.media).__name__
 
     return result
+
+
+def get_post_author(message) -> Optional[str]:
+    """Return the channel post signature/admin author display name, if present."""
+    post_author = getattr(message, "post_author", None)
+    if not post_author:
+        return None
+    return sanitize_name(str(post_author))
 
 
 def get_sender_name(message) -> str:

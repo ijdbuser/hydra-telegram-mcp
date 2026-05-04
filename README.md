@@ -52,6 +52,10 @@ The server currently includes 80+ MCP tools grouped into these areas:
 
 All tool results that include Telegram user-controlled content are sanitized and, where practical, returned as structured JSON.
 
+### Message Result Fields
+
+Message tools preserve `sender` as the Telegram peer display name. For signed channel posts, message results may also include `post_author`, which is Telegram's visible channel post signature/admin author string. This field is optional because Telegram only provides it for signed channel posts and it is not a resolvable user ID.
+
 ## Requirements
 
 - Python 3.10+
