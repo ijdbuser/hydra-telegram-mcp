@@ -1,15 +1,15 @@
-version: '3.8'
-
 services:
   telegram-mcp:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: telegram-mcp
-    # Load environment variables from a .env file in the same directory
-    env_file:
-      - .env
-    # Keep stdin open and allocate a pseudo-TTY, crucial for stdio MCP servers
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID:?TELEGRAM_API_ID is required}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:?TELEGRAM_API_HASH is required}
+      TELEGRAM_SESSION_STRING: ${TELEGRAM_SESSION_STRING:?TELEGRAM_SESSION_STRING is required}
+      FASTMCP_HOST: ${FASTMCP_HOST:-0.0.0.0}
+      FASTMCP_PORT: ${FASTMCP_PORT:-8000}
+    # Keep stdin open and allocate a pseudo-TTY for interactive local runs.
     stdin_open: true
     tty: true
     # Optional: Uncomment the following lines to mount a local directory

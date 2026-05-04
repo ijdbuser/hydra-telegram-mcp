@@ -9,9 +9,6 @@ ENV PYTHONDONTWRITEBYTECODE=1
 # Ensure Python output is sent straight to terminal (useful for logs)
 ENV PYTHONUNBUFFERED=1
 
-# Install system dependencies if needed (e.g., for certain Python packages)
-# RUN apt-get update && apt-get install -y --no-install-recommends some-package && rm -rf /var/lib/apt/lists/*
-
 # Copy dependency definition files
 # If using Poetry:
 # COPY pyproject.toml poetry.lock* ./
@@ -31,18 +28,11 @@ COPY telegram_mcp ./telegram_mcp
 RUN adduser --disabled-password --gecos "" appuser && chown -R appuser:appuser /app
 USER appuser
 
-# Define environment variables needed by the application
-# These should be provided at runtime, not hardcoded (especially secrets)
-ENV TELEGRAM_API_ID=""
-ENV TELEGRAM_API_HASH=""
-# Specify one of the following at runtime:
-# Default session filename
-ENV TELEGRAM_SESSION_NAME="telegram_mcp_session"
-# Or provide the session string directly
-ENV TELEGRAM_SESSION_STRING=""
+# Telegram credentials and session configuration must be provided at runtime,
+# for example through docker-compose env_file, docker run -e, or CI variables.
 
-# Expose any ports if the application were a web server (not needed for stdio MCP)
-# EXPOSE 8000
+# Expose the default FastMCP streamable HTTP port.
+EXPOSE 8000
 
 # Define the command to run the application
 CMD ["python", "main.py"]

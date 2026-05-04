@@ -17,7 +17,7 @@ async def _main() -> None:
 
         print(f"Telegram client(s) started ({labels}). Running MCP server...", file=sys.stderr)
         # Use the asynchronous entrypoint instead of mcp.run()
-        await mcp.run_stdio_async()
+        await mcp.run_streamable_http_async()
     except Exception as e:
         print(f"Error starting client: {e}", file=sys.stderr)
         if isinstance(e, sqlite3.OperationalError) and "database is locked" in str(e):
