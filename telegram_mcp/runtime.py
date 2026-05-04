@@ -93,7 +93,11 @@ load_dotenv()
 TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID"))
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
 
-mcp = FastMCP("telegram", host=(os.getenv("FASTMCP_HOST") if os.getenv("FASTMCP_HOST") is not None else "0.0.0.0"), port=int(os.getenv("FASTMCP_PORT") if os.getenv("FASTMCP_PORT") is not None else "8000"))
+mcp = FastMCP(
+    "telegram",
+    host=(os.getenv("FASTMCP_HOST") if os.getenv("FASTMCP_HOST") is not None else "0.0.0.0"),
+    port=int(os.getenv("FASTMCP_PORT") if os.getenv("FASTMCP_PORT") is not None else "8000"),
+)
 
 # Annotate all tool results with audience=["user"] so MCP clients know
 # the content is user-generated data, not instructions for the model.
