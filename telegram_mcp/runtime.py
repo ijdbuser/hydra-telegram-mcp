@@ -16,9 +16,12 @@ from urllib.parse import unquote, urlparse
 # Third-party libraries
 import nest_asyncio
 from dotenv import load_dotenv
+from mcp.server.auth.provider import TokenVerifier, AccessToken
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.types import Annotations, TextContent, ToolAnnotations
 from mcp.shared.exceptions import McpError
+from pydantic import AnyHttpUrl
 from pythonjsonlogger import jsonlogger
 from telethon import TelegramClient, functions, types, utils
 from telethon.sessions import StringSession
@@ -93,10 +96,41 @@ load_dotenv()
 TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID"))
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
 
+
+class SimpleTokenVerifier(TokenVerifier):
+    """Simple token verifier for demonstration."""
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        if token is None:
+            return None
+
+        # Clean the token: handle both "Bearer <token>" and just "<token>"
+        actual_token = token.split(" ")[-1]
+
+        expected_token = os.getenv("MCP_SECURITY_TOKEN")
+
+        if not expected_token:
+            print("WARNING: MCP_SECURITY_TOKEN is not set!")
+            return None
+
+        if actual_token == expected_token:
+            # Success! Return the AccessToken object
+            # 'sub' is the subject (usually a user ID), 'scopes' matches your AuthSettings
+            return AccessToken(token=actual_token, scopes=["user"], client_id="1")
+
+        return None
+
+
 mcp = FastMCP(
     "telegram",
     host=(os.getenv("FASTMCP_HOST") if os.getenv("FASTMCP_HOST") is not None else "0.0.0.0"),
     port=int(os.getenv("FASTMCP_PORT") if os.getenv("FASTMCP_PORT") is not None else "8000"),
+    auth=AuthSettings(
+        issuer_url=AnyHttpUrl("https://auth.example.com"),  # Authorization Server URL
+        resource_server_url=AnyHttpUrl("http://localhost:3001"),  # This server's URL
+        required_scopes=["user"],
+    ),
+    token_verifier=SimpleTokenVerifier(),
 )
 
 # Annotate all tool results with audience=["user"] so MCP clients know
