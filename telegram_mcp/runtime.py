@@ -121,16 +121,44 @@ class SimpleTokenVerifier(TokenVerifier):
         return None
 
 
+# Кондуктор: если он задан, токены приходят от него — с правами внутри и
+# подписью, которую проверяет JWKS. Без него остаётся прежний простой токен:
+# так сервис можно поднять локально, не поднимая рядом кондуктора.
+CONDUCTOR_ISSUER = (os.getenv("CONDUCTOR_ISSUER") or "").strip()
+SERVER_PUBLIC_URL = (
+    os.getenv("PUBLIC_URL")
+    or f"http://127.0.0.1:{os.getenv('FASTMCP_PORT', '8000')}"
+)
+
+if CONDUCTOR_ISSUER:
+    from telegram_mcp import conductor as conductor_contract
+
+    _verifier: TokenVerifier = conductor_contract.ConductorTokenVerifier(
+        CONDUCTOR_ISSUER,
+        service_token=os.getenv("CONDUCTOR_SERVICE_TOKEN"),
+    )
+    _auth = AuthSettings(
+        issuer_url=AnyHttpUrl(CONDUCTOR_ISSUER),
+        resource_server_url=AnyHttpUrl(SERVER_PUBLIC_URL),
+        # Права проверяются по каждому тулзу, а не одним общим списком,
+        # поэтому общих обязательных прав здесь нет.
+        required_scopes=[],
+    )
+else:
+    conductor_contract = None  # type: ignore[assignment]
+    _verifier = SimpleTokenVerifier()
+    _auth = AuthSettings(
+        issuer_url=AnyHttpUrl("https://auth.example.com"),
+        resource_server_url=AnyHttpUrl("http://localhost:3001"),
+        required_scopes=["user"],
+    )
+
 mcp = FastMCP(
     "telegram",
     host=(os.getenv("FASTMCP_HOST") if os.getenv("FASTMCP_HOST") is not None else "0.0.0.0"),
     port=int(os.getenv("FASTMCP_PORT") if os.getenv("FASTMCP_PORT") is not None else "8000"),
-    auth=AuthSettings(
-        issuer_url=AnyHttpUrl("https://auth.example.com"),  # Authorization Server URL
-        resource_server_url=AnyHttpUrl("http://localhost:3001"),  # This server's URL
-        required_scopes=["user"],
-    ),
-    token_verifier=SimpleTokenVerifier(),
+    auth=_auth,
+    token_verifier=_verifier,
 )
 
 # Annotate all tool results with audience=["user"] so MCP clients know
@@ -164,6 +192,75 @@ def _install_annotation_hook() -> None:
 
 
 _install_annotation_hook()
+
+
+def _install_conductor_contract() -> None:
+    """Манифест, здоровье и проверка прав по каждому тулу.
+
+    Права проверяются на входе в тул, а не одним общим списком: тулзов здесь
+    больше сотни, и «можно всё» означало бы «можно удалять чужие сообщения».
+    """
+    if conductor_contract is None:
+        return
+
+    from mcp.server.auth.middleware.auth_context import get_access_token
+    from mcp.types import CallToolRequest, CallToolResult, ServerResult, TextContent
+    from starlette.responses import JSONResponse
+
+    conductor_contract.set_tool_source(
+        lambda: [tool.name for tool in mcp._tool_manager.list_tools()]
+    )
+
+    @mcp.custom_route("/manifest", methods=["GET"])
+    async def manifest(request):
+        # Без токена и без секретов: кондуктору нужно узнать права раньше,
+        # чем появится первый выданный им токен.
+        return JSONResponse(
+            conductor_contract.build(SERVER_PUBLIC_URL, CONDUCTOR_ISSUER),
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @mcp.custom_route("/health", methods=["GET"])
+    async def health(request):
+        # Живость аккаунтов, а не процесса: сервис без подключённого аккаунта
+        # формально работает и при этом бесполезен.
+        accounts = {
+            label: bool(client.is_connected()) for label, client in clients.items()
+        }
+        return JSONResponse(
+            {
+                "status": "ok" if any(accounts.values()) else "no_accounts",
+                "checks": {"accounts": accounts},
+            }
+        )
+
+    original_handler = mcp._mcp_server.request_handlers[CallToolRequest]
+
+    async def guarded_handler(req):
+        token = get_access_token()
+        granted = set(getattr(token, "scopes", None) or [])
+        needed = conductor_contract.scope_for(req.params.name)
+        if needed and needed not in granted:
+            return ServerResult(
+                CallToolResult(
+                    content=[
+                        TextContent(
+                            type="text",
+                            text=(
+                                f"право {needed} не выдано: тул {req.params.name} "
+                                "требует его"
+                            ),
+                        )
+                    ],
+                    isError=True,
+                )
+            )
+        return await original_handler(req)
+
+    mcp._mcp_server.request_handlers[CallToolRequest] = guarded_handler
+
+
+_install_conductor_contract()
 
 
 # ---------------------------------------------------------------------------
