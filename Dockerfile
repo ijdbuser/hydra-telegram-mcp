@@ -9,6 +9,11 @@ ENV PYTHONDONTWRITEBYTECODE=1
 # Ensure Python output is sent straight to terminal (useful for logs)
 ENV PYTHONUNBUFFERED=1
 
+# Coolify проверяет живость командой curl внутри контейнера. В alpine его нет:
+# контейнер помечается нездоровым, Traefik выбрасывает его из маршрутизации, и
+# домен отвечает 503 при полностью живом приложении.
+RUN apk add --no-cache curl
+
 # Copy dependency definition files
 # If using Poetry:
 # COPY pyproject.toml poetry.lock* ./
