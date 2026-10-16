@@ -1,6 +1,8 @@
 dotenv>=0.9.9
 httpx>=0.28.1
-mcp[cli]>=1.4.1
+# mcp 2.x переименовал FastMCP в MCPServer и сменил API: код этого сервиса
+# написан под 1.x. Без верхней границы сборка ставит 2.x и падает на импорте.
+mcp[cli]>=1.4.1,<2
 nest-asyncio>=1.6.0
 python-dotenv>=1.1.0
 python-json-logger>=3.3.0
