@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable
 
@@ -25,6 +26,11 @@ SERVER_ID = "telegram"
 TITLE = "Telegram"
 SCHEMA = 1
 ALGORITHM = "EdDSA"
+
+# Приметы текущего обращения: токен гостя и его claims. Нужны тулзам, чтобы
+# забрать креды аккаунта у кондуктора тем же токеном, которым пришёл вызов:
+# другого канала для этого нет, а из окружения креды брать неоткуда.
+current_auth: ContextVar[dict] = ContextVar("conductor_current_auth", default={})
 
 SCOPES: tuple[dict[str, object], ...] = (
     {
@@ -152,7 +158,33 @@ def build(public_url: str, issuer: str) -> dict:
         "version": version(names),
         "auth": {"type": "conductor-jwt", "issuer": issuer.rstrip("/")},
         "scopes": [dict(scope) for scope in SCOPES],
-        "credentials": {"server_side": True, "fields": []},
+        # Настройки аккаунта объявляет сам сервис: у telegram это строка
+        # сессии и ключи приложения, и у каждого аккаунта они свои. Хранилище
+        # таких полей не объявляет вовсе — его конфиг живёт в переменных
+        # Coolify, а не в аккаунтах, и править его из кондуктора не нужно.
+        "credentials": {
+            "server_side": True,
+            "fields": [
+                {
+                    "key": "session",
+                    "label": "Строка сессии",
+                    "type": "secret",
+                    "required": True,
+                },
+                {
+                    "key": "api_id",
+                    "label": "API ID",
+                    "type": "text",
+                    "required": True,
+                },
+                {
+                    "key": "api_hash",
+                    "label": "API hash",
+                    "type": "secret",
+                    "required": True,
+                },
+            ],
+        },
         "accounts": {"mode": "multiple", "label": "Аккаунт Telegram"},
         "tools": [
             {"name": name, "scopes": [scope_for(name)] if scope_for(name) else []}
@@ -295,6 +327,9 @@ class ConductorTokenVerifier:
             return None
 
         scopes = [part for part in str(claims.get("scope") or "").split() if part]
+        # Токен принят — оставляем обращение для тулзов: клиента аккаунта
+        # собирают они, и креды им отдаёт кондуктор по этому же токену.
+        current_auth.set({"token": token, "claims": claims})
         # В AccessToken этой версии SDK есть только token/client_id/scopes:
         # ни subject, ни claims туда не положить. Аккаунт и jti берутся из
         # самого токена там, где понадобятся (например, при обмене на креды).

@@ -3,12 +3,23 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    container_name: mcp-telegram
+    # Секреты (API ID, hash, строка сессии, сервисный токен) остаются в .env:
+    # в compose они не переписываются, чтобы не расползались по двум местам.
+    env_file:
+      - .env
     environment:
-      TELEGRAM_API_ID: ${TELEGRAM_API_ID:?TELEGRAM_API_ID is required}
-      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:?TELEGRAM_API_HASH is required}
-      TELEGRAM_SESSION_STRING: ${TELEGRAM_SESSION_STRING:?TELEGRAM_SESSION_STRING is required}
-      FASTMCP_HOST: ${FASTMCP_HOST:-0.0.0.0}
-      FASTMCP_PORT: ${FASTMCP_PORT:-8000}
+      FASTMCP_HOST: 0.0.0.0
+      FASTMCP_PORT: 8000
+      # Издатель токенов — кондуктор стенда. Адрес — имя его контейнера в
+      # общей сети: по нему же сервис забирает ключи подписи и отзывы.
+      CONDUCTOR_ISSUER: http://mcp-conductor:8000
+      PUBLIC_URL: http://mcp-telegram:8000
+    ports:
+      # Только для проверки руками с хоста: кондуктор ходит по имени.
+      - "${TELEGRAM_PORT:-8098}:8000"
+    networks:
+      - mcp-conductor
     # Keep stdin open and allocate a pseudo-TTY for interactive local runs.
     stdin_open: true
     tty: true
@@ -18,3 +29,8 @@ services:
     # volumes:
     #   - ./telegram_sessions:/app
     restart: unless-stopped
+
+networks:
+  # Сеть стенда кондуктора: он её создаёт, сервис к ней только подключается.
+  mcp-conductor:
+    external: true

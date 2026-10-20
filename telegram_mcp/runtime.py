@@ -15,6 +15,7 @@ from urllib.parse import unquote, urlparse
 
 # Third-party libraries
 import nest_asyncio
+import httpx
 from dotenv import load_dotenv
 from mcp.server.auth.provider import TokenVerifier, AccessToken
 from mcp.server.auth.settings import AuthSettings
@@ -93,8 +94,11 @@ def get_entity_filter_type(entity: Any) -> Optional[str]:
 
 load_dotenv()
 
-TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID"))
-TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
+# В окружении они нужны только тогда, когда сессия тоже пришла из окружения.
+# Если аккаунт заведён в кондукторе, API ID и hash едут вместе со строкой
+# сессии оттуда, и требовать их здесь нечего.
+TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID") or 0)
+TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH") or ""
 
 
 class SimpleTokenVerifier(TokenVerifier):
@@ -125,6 +129,7 @@ class SimpleTokenVerifier(TokenVerifier):
 # подписью, которую проверяет JWKS. Без него остаётся прежний простой токен:
 # так сервис можно поднять локально, не поднимая рядом кондуктора.
 CONDUCTOR_ISSUER = (os.getenv("CONDUCTOR_ISSUER") or "").strip()
+CONDUCTOR_SERVICE_TOKEN = (os.getenv("CONDUCTOR_SERVICE_TOKEN") or "").strip()
 SERVER_PUBLIC_URL = (
     os.getenv("PUBLIC_URL")
     or f"http://127.0.0.1:{os.getenv('FASTMCP_PORT', '8000')}"
@@ -135,7 +140,7 @@ if CONDUCTOR_ISSUER:
 
     _verifier: TokenVerifier = conductor_contract.ConductorTokenVerifier(
         CONDUCTOR_ISSUER,
-        service_token=os.getenv("CONDUCTOR_SERVICE_TOKEN"),
+        service_token=CONDUCTOR_SERVICE_TOKEN or None,
     )
     _auth = AuthSettings(
         issuer_url=AnyHttpUrl(CONDUCTOR_ISSUER),
@@ -227,12 +232,45 @@ def _install_conductor_contract() -> None:
         accounts = {
             label: bool(client.is_connected()) for label, client in clients.items()
         }
+        # Аккаунт, который не собрался, — это сломанная настройка, а не
+        # «просто нет аккаунтов»: причина едет отдельным полем, чтобы её было
+        # видно в панели.
+        warnings = dict(_account_errors)
+        if warnings:
+            status = "unhealthy"
+        elif any(accounts.values()):
+            status = "ok"
+        else:
+            status = "no_accounts"
         return JSONResponse(
             {
-                "status": "ok" if any(accounts.values()) else "no_accounts",
+                "status": status,
                 "checks": {"accounts": accounts},
+                "warnings": warnings,
             }
         )
+
+    @mcp.custom_route("/check-credentials", methods=["POST"])
+    async def check_credentials_route(request):
+        """Проверить креды до того, как их сохранят.
+
+        Токен тот же, что у вызовов: проверять может только тот, кого кондуктор
+        уже пустил к этому сервису.
+        """
+        header = request.headers.get("authorization", "")
+        token = header[7:].strip() if header.lower().startswith("bearer ") else ""
+        access = await _verifier.verify_token(token) if token else None
+        if access is None:
+            return JSONResponse({"error": "invalid_token"}, status_code=401)
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        result = await check_credentials(
+            body.get("credentials") or {}, str(body.get("account") or "")
+        )
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
     original_handler = mcp._mcp_server.request_handlers[CallToolRequest]
 
@@ -359,7 +397,12 @@ def _build_proxy_for_label(label: str) -> tuple[Optional[Any], Optional[Any]]:
     return proxy, None
 
 
-def _build_client(session: Any, label: str) -> TelegramClient:
+def _build_client(
+    session: Any,
+    label: str,
+    api_id: int | None = None,
+    api_hash: str | None = None,
+) -> TelegramClient:
     """Construct a ``TelegramClient`` honoring per-label proxy configuration."""
     proxy, connection = _build_proxy_for_label(label)
     kwargs: dict[str, Any] = {}
@@ -367,7 +410,12 @@ def _build_client(session: Any, label: str) -> TelegramClient:
         kwargs["proxy"] = proxy
     if connection is not None:
         kwargs["connection"] = connection
-    return TelegramClient(session, TELEGRAM_API_ID, TELEGRAM_API_HASH, **kwargs)
+    return TelegramClient(
+        session,
+        api_id or TELEGRAM_API_ID,
+        api_hash or TELEGRAM_API_HASH,
+        **kwargs,
+    )
 
 
 def _discover_accounts() -> dict[str, TelegramClient]:
@@ -404,6 +452,14 @@ def _discover_accounts() -> dict[str, TelegramClient]:
         accounts["default"] = _build_client(session_name, "default")
 
     if not accounts:
+        if CONDUCTOR_ISSUER:
+            # Кредов в окружении нет — и это норма: они лежат у кондуктора, а
+            # клиент собирается по первому обращению к аккаунту.
+            print(
+                "Аккаунтов в окружении нет; креды будут взяты у кондуктора.",
+                file=sys.stderr,
+            )
+            return {}
         print(
             "Error: No Telegram session configured. "
             "Set TELEGRAM_SESSION_STRING or TELEGRAM_SESSION_STRING_<LABEL> in .env",
@@ -412,6 +468,189 @@ def _discover_accounts() -> dict[str, TelegramClient]:
         sys.exit(1)
 
     return accounts
+
+
+# Клиенты из кредов кондуктора: аккаунт собирается по первому обращению,
+# потому что на старте токена гостя ещё нет, а без него креды не отдают.
+# Версия кредов запоминается — поменяли значение в панели, соединение
+# пересобирается.
+_remote_versions: dict[str, int] = {}
+_remote_locks: dict[str, asyncio.Lock] = {}
+_remote_checked_at: dict[str, float] = {}
+# Что не так с аккаунтом из кредов кондуктора: показывается в /health, чтобы
+# кондуктор мог покраснеть и объяснить причину, а не молчать.
+_account_errors: dict[str, str] = {}
+
+# Как часто переспрашивать версию кредов. Реже, чем обращение: ходить к
+# кондуктору на каждый вызов противоречило бы смыслу «права внутри токена».
+# Минуты хватает — правку в панели видно почти сразу, а лишних запросов нет.
+_REVALIDATE_SECONDS = 60.0
+
+
+def _lock_for(label: str) -> asyncio.Lock:
+    if label not in _remote_locks:
+        _remote_locks[label] = asyncio.Lock()
+    return _remote_locks[label]
+
+
+async def _fetch_account_credentials(account: str) -> dict:
+    """Забрать креды аккаунта у кондуктора.
+
+    Удостоверений два: сервисный токен говорит, какой это сервис, токен гостя —
+    что этот гость вправе пользоваться аккаунтом. Одного сервисного мало:
+    иначе сервис мог бы взять любой аккаунт, до которого его гость не дорос.
+    """
+    auth = conductor_contract.current_auth.get() if conductor_contract else {}
+    guest = str(auth.get("token") or "")
+    if not guest:
+        raise RuntimeError("нет токена гостя: креды аккаунта не спросить")
+    if not CONDUCTOR_SERVICE_TOKEN:
+        raise RuntimeError("нет CONDUCTOR_SERVICE_TOKEN: креды аккаунта не спросить")
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        response = await client.post(
+            f"{CONDUCTOR_ISSUER}/exchange",
+            json={"subject_token": guest, "account": account},
+            headers={"Authorization": f"Bearer {CONDUCTOR_SERVICE_TOKEN}"},
+        )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"кондуктор ответил {response.status_code}: {response.text[:120]}"
+        )
+    return response.json()
+
+
+async def ensure_account(account: str) -> TelegramClient:
+    """Собрать клиента аккаунта из кредов кондуктора.
+
+    Один раз на аккаунт: дальше клиент живёт в общем реестре и находится как
+    обычно. Если версия кредов изменилась, соединение пересобирается — иначе
+    работа шла бы по старым значениям.
+    """
+    label = account.strip().lower()
+    known = clients.get(label)
+    fresh = time.monotonic() - _remote_checked_at.get(label, 0.0) < _REVALIDATE_SECONDS
+    if known is not None and fresh:
+        return known
+
+    async with _lock_for(label):
+        try:
+            data = await _fetch_account_credentials(label)
+        except Exception as error:
+            _account_errors[label] = f"{type(error).__name__}: {error}"
+            raise
+        version = int(data.get("credential_version") or 0)
+        if known is not None and _remote_versions.get(label) == version:
+            _remote_checked_at[label] = time.monotonic()
+            return known
+        if known is not None:
+            try:
+                await known.disconnect()
+            except Exception:  # noqa: BLE001 - старый клиент уже не нужен
+                pass
+
+        # Любая беда тут — это сломанная настройка аккаунта, и причина должна
+        # попасть в /health, а не остаться в логе.
+        try:
+            values = data.get("credentials") or {}
+            session_value = str(values.get("session") or "")
+            if not session_value:
+                raise RuntimeError(f"у аккаунта {label} нет строки сессии")
+            client = _build_client(
+                StringSession(session_value),
+                label,
+                int(values.get("api_id") or 0) or None,
+                str(values.get("api_hash") or "") or None,
+            )
+            await client.connect()
+            if not await client.is_user_authorized():
+                raise RuntimeError(f"сессия аккаунта {label} не авторизована")
+        except Exception as error:
+            _account_errors[label] = f"{type(error).__name__}: {error}"
+            raise
+
+        # Прогрев кэша сущностей: у строковой сессии его нет, а без него
+        # первый поиск по чатам идёт в Telegram заново. Сбой прогрева — не
+        # повод считать аккаунт сломанным.
+        try:
+            await client.get_dialogs()
+        except Exception:  # noqa: BLE001 - кэш, а не работа
+            pass
+        clients[label] = client
+        _remote_versions[label] = version
+        _remote_checked_at[label] = time.monotonic()
+        _account_errors.pop(label, None)
+        return client
+
+
+async def check_credentials(values: dict, account: str = "") -> dict:
+    """Попробовать креды, ничего не сохраняя: подключиться и спросить профиль.
+
+    Нужно панели: аккаунт заводят только тогда, когда эти значения уже
+    работают. Живого клиента того же аккаунта убираем — иначе два соединения с
+    одной сессией мешают друг другу, а соберётся он заново из сохранённого.
+    """
+    label = account.strip().lower()
+    if label and label in clients:
+        try:
+            await clients.pop(label).disconnect()
+        except Exception:  # noqa: BLE001 - старый клиент уже не нужен
+            pass
+        _remote_versions.pop(label, None)
+        _remote_checked_at.pop(label, None)
+
+    session_value = str(values.get("session") or "")
+    client = None
+    try:
+        # Строка сессии может быть битой (скопировали не целиком) — это такой
+        # же отказ проверки, как и неверный ключ, и падать в 500 ему незачем.
+        api_id = int(values.get("api_id") or 0) or TELEGRAM_API_ID
+        api_hash = str(values.get("api_hash") or "") or TELEGRAM_API_HASH
+        if not (session_value and api_id and api_hash):
+            return {"ok": False, "error": "нужны строка сессии, API ID и API hash"}
+        try:
+            session = StringSession(session_value)
+        except Exception as error:  # noqa: BLE001 - битая строка это отказ
+            return {
+                "ok": False,
+                "error": f"строка сессии не разбирается ({error})",
+            }
+        client = _build_client(session, label or "check", api_id, api_hash)
+        await client.connect()
+        if not await client.is_user_authorized():
+            return {"ok": False, "error": "сессия не авторизована"}
+        me = await client.get_me()
+        name = " ".join(
+            part
+            for part in (getattr(me, "first_name", "") or "", getattr(me, "last_name", "") or "")
+            if part
+        )
+        return {
+            "ok": True,
+            "name": name or "без имени",
+            "username": getattr(me, "username", None),
+            "phone": getattr(me, "phone", None),
+        }
+    except Exception as error:  # noqa: BLE001 - причина и есть ответ
+        return {"ok": False, "error": f"{type(error).__name__}: {error}"}
+    finally:
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:  # noqa: BLE001 - соединение уже закрывается
+                pass
+
+
+async def ensure_current_account() -> None:
+    """Собрать клиента аккаунта из текущего обращения, если его ещё нет.
+
+    Нужно тулзам, которые смотрят на весь реестр, а не на один аккаунт: с
+    кредами у кондуктора реестр пуст до первого обращения, и такой тулз
+    честно показывал бы пустоту.
+    """
+    label = _resolve_account_label(None)
+    if label and (label not in clients or label in _remote_versions):
+        await ensure_account(label)
 
 
 clients: dict[str, TelegramClient] = _discover_accounts()
@@ -436,6 +675,35 @@ def is_multi_mode() -> bool:
     return len(clients) > 1
 
 
+def _account_from_token() -> str:
+    """Аккаунт, выписанный в токене.
+
+    Панель и клиенты зовут тулзы, не называя аккаунт: он уже в токене, и
+    повторять его в аргументах значило бы разрешить звать чужой.
+    """
+    auth = conductor_contract.current_auth.get() if conductor_contract else {}
+    claims = auth.get("claims") or {}
+    return str(claims.get("account") or "").strip().lower()
+
+
+def _resolve_account_label(explicit: str | None) -> str:
+    """Какой аккаунт нужен этому вызову.
+
+    Порядок: названный в аргументах, названный в токене, единственный в
+    реестре, и только если реестр пуст — «default», как у кондуктора. Пустая
+    строка значит «вызов разберётся сам»: так сохраняется прежнее поведение
+    многоаккаунтного режима, где имя обязательно и берётся из аргументов.
+    """
+    if explicit:
+        return str(explicit).strip().lower()
+    from_token = _account_from_token()
+    if from_token:
+        return from_token
+    if len(clients) == 1:
+        return next(iter(clients))
+    return "default" if not clients else ""
+
+
 def with_account(readonly=False):
     """Decorator that adds multi-account support to MCP tools.
 
@@ -453,9 +721,27 @@ def with_account(readonly=False):
         @wraps(fn)
         async def wrapper(*args, **kwargs):
             account = kwargs.get("account")
+            label = _resolve_account_label(account)
+            # Перепроверяем только те аккаунты, что пришли от кондуктора:
+            # клиенты из окружения живут сами по себе.
+            if label and (label not in clients or label in _remote_versions):
+                # Креды аккаунта лежат у кондуктора, и забрать их можно только
+                # с токеном этого обращения. Внутри решается, собирать клиента
+                # заново (значение поменяли) или оставить прежний.
+                try:
+                    await ensure_account(label)
+                except Exception as error:  # noqa: BLE001 - причина и есть ответ
+                    if label not in clients:
+                        return f"Error: аккаунт '{label}' не готов: {error}"
+                    # Кондуктор молчит на перепроверке — работаем на прежнем
+                    # соединении: гасить доступ из-за одной неудачи хуже.
+            # Аккаунт передаём дальше только когда клиентов несколько: с одним
+            # тулзы и так берут его сами, и явное имя меняло бы их поведение.
+            if kwargs.get("account") is None and label and len(clients) > 1:
+                kwargs["account"] = label
 
             # Explicit account OR single-mode -> call once
-            if account is not None or not is_multi_mode():
+            if kwargs.get("account") is not None or not is_multi_mode():
                 return await fn(*args, **kwargs)
 
             # account is None AND multi-mode
